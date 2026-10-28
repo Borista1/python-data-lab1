@@ -1,0 +1,445 @@
+=== config.py ===
+# src/config.py
+# Простой файл с настройками и путями к файлам
+
+RAW_GEONAMES = "data/raw/geonames.csv"
+RAW_CITIES = "data/raw/worldcities.csv"
+RAW_POPULATION = "data/raw/world_population.csv"
+
+SAMPLE_CSV = "data/interim/sample_200k.csv"
+INTERIM_PARQUET = "data/interim/source.parquet"
+INTERIM_FEATHER = "data/interim/source.feather"
+INTERIM_PICKLE = "data/interim/source.pkl"
+TYPED_PARQUET = "data/interim/source_typed.parquet"
+
+CLEAN_PARQUET = "data/processed/clean.parquet"
+LOG_FILE = "logs/cleaning.log"
+
+# Оптимальная схема типов для таблицы городов (worldcities)
+SCHEMA_CITIES = {
+    "city": "string",
+    "city_ascii": "string",
+    "lat": "float32",
+    "lng": "float32",
+    "country": "category",
+    "iso2": "category",
+    "iso3": "category",
+    "admin_name": "string",
+    "capital": "category",
+    "population": "float32",
+    "id": "int64",
+}
+
+=== io_utils.py ===
+# src/io_utils.py
+import os
+import time
+from pathlib import Path
+import pandas as pd
+from src import config
+
+
+def inspect_raw_file(filepath):
+    """Шаг 6: Узнаем размер файла и читаем первые 5 строк без загрузки всего файла."""
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    print(f"Файл: {filepath}")
+    print(f"Размер: {size_mb:.2f} МБ")
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for i in range(5):
+            line = f.readline().strip()
+            print(f"Строка {i}: {line[:120]}")
+    print("-" * 50)
+
+
+def make_sample_200k(input_path, output_path, num_rows=200000):
+    """Шаг 6: Потоковое чтение первых 200 000 строк из большого файла geonames.csv."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    count = 0
+    with (
+        open(input_path, "r", encoding="utf-8", errors="replace") as fin,
+        open(output_path, "w", encoding="utf-8") as fout,
+    ):
+        for line in fin:
+            fout.write(line)
+            count += 1
+            # +1 строка на заголовок столбцов
+            if count >= num_rows + 1:
+                break
+
+    print(f"Готово! Записано {count - 1} строк в файл {output_path}")
+
+
+def read_csv_auto(filepath):
+    """Простая функция чтения CSV, которая сама определяет разделитель (; или ,)."""
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        first_line = f.readline()
+
+    if ";" in first_line and first_line.count(";") >= first_line.count(","):
+        sep = ";"
+    elif "\t" in first_line:
+        sep = "\t"
+    else:
+        sep = ","
+
+    return pd.read_csv(filepath, sep=sep, encoding="utf-8", low_memory=False)
+
+
+def benchmark_formats(csv_path):
+    """Шаг 9: Сравнение CSV, Pickle, Feather и Parquet."""
+    results = []
+
+    # 1. Читаем исходный CSV
+    t0 = time.perf_counter()
+    df = read_csv_auto(csv_path)
+    csv_read_time = time.perf_counter() - t0
+    csv_size = os.path.getsize(csv_path) / (1024 * 1024)
+    results.append(["CSV (исходный)", csv_size, 0.0, csv_read_time])
+
+    # 2. Pickle
+    t0 = time.perf_counter()
+
+    from pathlib import Path
+
+    Path(config.INTERIM_PICKLE).parent.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.perf_counter()
+    df.to_pickle(config.INTERIM_PICKLE)
+    w_time = time.perf_counter() - t0
+    df.to_pickle(config.INTERIM_PICKLE)
+    w_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _ = pd.read_pickle(config.INTERIM_PICKLE)
+    r_time = time.perf_counter() - t0
+    size = os.path.getsize(config.INTERIM_PICKLE) / (1024 * 1024)
+    results.append(["Pickle", size, w_time, r_time])
+
+    # 3. Feather
+    t0 = time.perf_counter()
+    df.to_feather(config.INTERIM_FEATHER)
+    w_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _ = pd.read_feather(config.INTERIM_FEATHER)
+    r_time = time.perf_counter() - t0
+    size = os.path.getsize(config.INTERIM_FEATHER) / (1024 * 1024)
+    results.append(["Feather", size, w_time, r_time])
+
+    # 4. Parquet (snappy)
+    t0 = time.perf_counter()
+    df.to_parquet(config.INTERIM_PARQUET, compression="snappy")
+    w_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _ = pd.read_parquet(config.INTERIM_PARQUET)
+    r_time = time.perf_counter() - t0
+    size = os.path.getsize(config.INTERIM_PARQUET) / (1024 * 1024)
+    results.append(["Parquet (snappy)", size, w_time, r_time])
+
+    # 5. Parquet (только 3 первых столбца)
+    cols_3 = list(df.columns[:3])
+    t0 = time.perf_counter()
+    _ = pd.read_parquet(config.INTERIM_PARQUET, columns=cols_3)
+    r_time_3 = time.perf_counter() - t0
+    results.append(["Parquet, 3 столбца", size, 0.0, r_time_3])
+
+    res_df = pd.DataFrame(
+        results, columns=["Формат", "Объём, МБ", "Запись, с", "Чтение, с"]
+    )
+    res_df["Отношение объёма к CSV"] = res_df["Объём, МБ"] / csv_size
+    return res_df
+
+
+=== cleaning.py ===
+# src/cleaning.py
+import logging
+import pandas as pd
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+
+def clean_column_names(df):
+    """1. Приводим имена столбцов к нижнему регистру и заменяем пробелы/символы на _."""
+    new_cols = []
+    for col in df.columns:
+        c = col.strip().lower()
+        c = c.replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        c = c.replace("²", "2")
+        new_cols.append(c)
+    df.columns = new_cols
+    log.info("Имена столбцов приведены к единому виду: %s", list(df.columns))
+    return df
+
+
+def join_datasets(cities_df, pop_df):
+    """2. Соединяем таблицу городов и справочник стран по коду ISO3 / CCA3."""
+    before_len = len(cities_df)
+
+    # Очищаем ключи от лишних пробелов и приводим к верхнему регистру
+    cities_df["iso3"] = cities_df["iso3"].astype(str).str.strip().str.upper()
+    pop_df["cca3"] = pop_df["cca3"].astype(str).str.strip().str.upper()
+
+    # Убираем возможные дубликаты ключа в справочнике
+    pop_df = pop_df.drop_duplicates(subset=["cca3"])
+
+    # Делаем левое соединение (left join)
+    merged_df = pd.merge(cities_df, pop_df, left_on="iso3", right_on="cca3", how="left")
+
+    after_len = len(merged_df)
+    unmatched = merged_df["cca3"].isna().sum()
+
+    log.info(
+        "Соединение таблиц: было %d строк, стало %d строк. Не сопоставилось: %d записей",
+        before_len,
+        after_len,
+        unmatched,
+    )
+    return merged_df
+
+
+def convert_types(df):
+    """3. Явное приведение типов данных."""
+    num_cols = [
+        "lat",
+        "lng",
+        "population",
+        "2022_population",
+        "area_km2",
+        "growth_rate",
+    ]
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "id" in df.columns:
+        df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype("int64")
+
+    log.info("Приведение числовых типов завершено. Строк: %d", len(df))
+    return df
+
+
+def replace_hidden_missing(df):
+    """4. Замена скрытых пропусков ('', '-', 'нет данных', 'nan', 0 в населении) на NaN."""
+    hidden_values = ["", "-", "нет данных", "none", "null", "nan", "N/A"]
+    df = df.replace(hidden_values, np.nan)
+
+    if "population" in df.columns:
+        zero_count = (df["population"] == 0).sum()
+        df.loc[df["population"] == 0, "population"] = np.nan
+        log.info("Заменено нулевых значений в population на NaN: %d", zero_count)
+
+    return df
+
+
+def handle_missing_values(df):
+    """5. Обработка пропусков: заполнение медианой и 'unknown'."""
+    before_len = len(df)
+
+    # Удаляем строки, где нет названия города или координат
+    df = df.dropna(subset=["city", "lat", "lng"]).copy()
+
+    # Для статуса столицы (capital) пустые значения означают обычный город ('not_capital')
+    if "capital" in df.columns:
+        df["capital"] = df["capital"].fillna("not_capital")
+
+    # Для региона (admin_name) ставим 'unknown'
+    if "admin_name" in df.columns:
+        df["admin_name"] = df["admin_name"].fillna("unknown")
+
+    # Для населения города добавляем флаг пропуска и заполняем медианой по стране
+    if "population" in df.columns:
+        df["is_population_missing"] = df["population"].isna()
+        median_pop = df["population"].median()
+        df["population"] = df["population"].fillna(median_pop)
+
+    log.info(
+        "Обработка пропусков: было %d строк, стало %d (удалено %d)",
+        before_len,
+        len(df),
+        before_len - len(df),
+    )
+    return df
+
+
+def remove_duplicates(df):
+    """6. Удаление полных дубликатов и дубликатов по ключу id."""
+    before_len = len(df)
+    df = df.drop_duplicates()
+    after_full = len(df)
+
+    if "id" in df.columns:
+        df = df.drop_duplicates(subset=["id"], keep="last")
+    after_key = len(df)
+
+    log.info(
+        "Дубликаты: было %d, после полных %d, после ключа id %d (удалено всего %d)",
+        before_len,
+        after_full,
+        after_key,
+        before_len - after_key,
+    )
+    return df
+
+
+def normalize_categories_and_text(df):
+    """7-8. Нормализация категорий и очистка текстовых полей от лишних пробелов."""
+    text_cols = ["city", "city_ascii", "country", "admin_name", "capital", "continent"]
+    for col in text_cols:
+        if col in df.columns:
+            # Переводим в строку, убираем двойные и краевые пробелы
+            df[col] = (
+                df[col].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+            )
+
+    if "capital" in df.columns:
+        df["capital"] = df["capital"].str.lower()
+        # Оставляем только известные категории, редкие/ошибочные меняем на 'other'
+        valid_caps = ["primary", "admin", "minor", "not_capital"]
+        df.loc[~df["capital"].isin(valid_caps), "capital"] = "other"
+        df["capital"] = df["capital"].astype("category")
+
+    if "continent" in df.columns:
+        df["continent"] = df["continent"].fillna("Unknown").astype("category")
+
+    log.info("Нормализация текста и категорий выполнена. Строк: %d", len(df))
+    return df
+
+
+def check_business_rules(df):
+    """9-10. Проверка предметных ограничений (широта [-90, 90], долгота [-180, 180], население > 0)."""
+    before_len = len(df)
+
+    cond_lat = (df["lat"] >= -90) & (df["lat"] <= 90)
+    cond_lng = (df["lng"] >= -180) & (df["lng"] <= 180)
+    cond_pop = df["population"] > 0
+
+    df = df[cond_lat & cond_lng & cond_pop].copy()
+    log.info(
+        "Проверка диапазонов: было %d, стало %d (удалено некорректных: %d)",
+        before_len,
+        len(df),
+        before_len - len(df),
+    )
+    return df
+
+
+def detect_outliers(df):
+    """11. Выявление выбросов двумя способами (IQR и правило 3 сигм) и добавление флага."""
+    pop = df["population"]
+
+    # Способ 1: Межквартильный размах (IQR)
+    q1 = pop.quantile(0.25)
+    q3 = pop.quantile(0.75)
+    iqr = q3 - q1
+    upper_iqr = q3 + 1.5 * iqr
+    outliers_iqr = (pop > upper_iqr).sum()
+
+    # Способ 2: Правило 3 сигм
+    mean_val = pop.mean()
+    std_val = pop.std()
+    upper_3sigma = mean_val + 3 * std_val
+    outliers_3sigma = (pop > upper_3sigma).sum()
+
+    # Не удаляем крупные мегаполисы (Токио, Москва и т.д.), а помечаем флагом!
+    df["is_megacity_outlier"] = pop > upper_3sigma
+
+    log.info(
+        "Выбросы по population: метод IQR нашел %d, метод 3 сигм нашел %d. Добавлен столбец-флаг.",
+        outliers_iqr,
+        outliers_3sigma,
+    )
+    return df
+
+
+=== pipeline.py ===
+# src/pipeline.py
+import os
+import argparse
+import logging
+from src import config
+from src.io_utils import read_csv_auto
+from src.cleaning import (
+    clean_column_names,
+    join_datasets,
+    convert_types,
+    replace_hidden_missing,
+    handle_missing_values,
+    remove_duplicates,
+    normalize_categories_and_text,
+    check_business_rules,
+    detect_outliers,
+)
+
+
+def setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def run_pipeline(cities_path, pop_path, output_path, sample=False):
+    log = logging.getLogger(__name__)
+    log.info("=== ЗАПУСК КОНВЕЙЕРА ОЧИСТКИ ДАННЫХ ===")
+
+    if not os.path.exists(cities_path):
+        raise FileNotFoundError(f"Файл не найден: {cities_path}")
+    if not os.path.exists(pop_path):
+        raise FileNotFoundError(f"Файл не найден: {pop_path}")
+
+    cities_df = read_csv_auto(cities_path)
+    pop_df = read_csv_auto(pop_path)
+
+    if sample:
+        cities_df = cities_df.head(5000)
+        log.info("Включен режим среза (--sample): взято 5000 строк")
+
+    initial_rows = len(cities_df)
+    log.info("Исходное число строк: %d", initial_rows)
+
+    # Применяем функции очистки по очереди
+    cities_df = clean_column_names(cities_df)
+    pop_df = clean_column_names(pop_df)
+
+    df = join_datasets(cities_df, pop_df)
+    df = convert_types(df)
+    df = replace_hidden_missing(df)
+    df = handle_missing_values(df)
+    df = remove_duplicates(df)
+    df = normalize_categories_and_text(df)
+    df = check_business_rules(df)
+    df = detect_outliers(df)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df.to_parquet(output_path, index=False)
+
+    final_rows = len(df)
+    lost_pct = (initial_rows - final_rows) / initial_rows * 100
+    log.info(
+        "=== ОЧИСТКА ЗАВЕРШЕНА: Было %d, Стало %d (Потеряно %.2f%%) ===",
+        initial_rows,
+        final_rows,
+        lost_pct,
+    )
+    log.info("Результат сохранен в %s", output_path)
+    return df
+
+
+if __name__ == "__main__":
+    setup_logging()
+    parser = argparse.ArgumentParser(description="Конвейер очистки данных ЛР1")
+    parser.add_argument("--input", default=config.RAW_CITIES, help="Путь к исходному файлу")
+    parser.add_argument("--pop", default=config.RAW_POPULATION, help="Путь к справочнику стран")
+    parser.add_argument("--output", default=config.CLEAN_PARQUET, help="Путь к результату")
+    parser.add_argument("--sample", action="store_true", help="Запуск на небольшом срезе")
+
+    args = parser.parse_args()
+    run_pipeline(args.input, args.pop, args.output, sample=args.sample)
